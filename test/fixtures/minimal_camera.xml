@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<RegisterDescription
+    ModelName="MinimalTestCam"
+    VendorName="GenICam.jl"
+    StandardNameSpace="None"
+    SchemaMajorVersion="1"
+    SchemaMinorVersion="1"
+    SchemaSubMinorVersion="0"
+    MajorVersion="1"
+    MinorVersion="0"
+    SubMinorVersion="0"
+    ToolTip="Synthetic XML for GenICam.jl unit tests"
+    ProductGuid="00000000-0000-0000-0000-000000000001"
+    VersionGuid="00000000-0000-0000-0000-000000000002"
+    xmlns="http://www.genicam.org/GenApi/Version_1_1"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.genicam.org/GenApi/Version_1_1
+                        http://www.genicam.org/GenApi/GenApiSchema_Version_1_1.xsd">
+
+    <Integer Name="Width">
+        <pValue>WidthReg</pValue>
+        <Min>1</Min>
+        <Max>1920</Max>
+        <Inc>1</Inc>
+    </Integer>
+
+    <IntReg Name="WidthReg">
+        <Address>0x10000</Address>
+        <Length>4</Length>
+        <AccessMode>RW</AccessMode>
+        <pPort>Device</pPort>
+        <Sign>Unsigned</Sign>
+        <Endianess>LittleEndian</Endianess>
+    </IntReg>
+
+    <Integer Name="Height">
+        <pValue>HeightReg</pValue>
+        <Min>1</Min>
+        <Max>1080</Max>
+        <Inc>1</Inc>
+    </Integer>
+
+    <IntReg Name="HeightReg">
+        <Address>0x10004</Address>
+        <Length>4</Length>
+        <AccessMode>RW</AccessMode>
+        <pPort>Device</pPort>
+        <Sign>Unsigned</Sign>
+        <Endianess>BigEndian</Endianess>
+    </IntReg>
+
+    <Enumeration Name="PixelFormat">
+        <EnumEntry Name="Mono8">
+            <Value>0x01080001</Value>
+        </EnumEntry>
+        <EnumEntry Name="Mono16">
+            <Value>0x01100007</Value>
+        </EnumEntry>
+        <EnumEntry Name="RGB8">
+            <Value>0x02180014</Value>
+        </EnumEntry>
+        <pValue>PixelFormatReg</pValue>
+    </Enumeration>
+
+    <IntReg Name="PixelFormatReg">
+        <Address>0x10010</Address>
+        <Length>4</Length>
+        <AccessMode>RW</AccessMode>
+        <pPort>Device</pPort>
+        <Sign>Unsigned</Sign>
+        <Endianess>LittleEndian</Endianess>
+    </IntReg>
+
+    <Integer Name="PayloadSize">
+        <pValue>PayloadSizeReg</pValue>
+        <Min>0</Min>
+        <Max>16777216</Max>
+    </Integer>
+
+    <IntReg Name="PayloadSizeReg">
+        <Address>0x10020</Address>
+        <Length>4</Length>
+        <AccessMode>RO</AccessMode>
+        <pPort>Device</pPort>
+        <Sign>Unsigned</Sign>
+        <Endianess>LittleEndian</Endianess>
+    </IntReg>
+
+    <Enumeration Name="AcquisitionMode">
+        <EnumEntry Name="SingleFrame">
+            <Value>0</Value>
+        </EnumEntry>
+        <EnumEntry Name="MultiFrame">
+            <Value>1</Value>
+        </EnumEntry>
+        <EnumEntry Name="Continuous">
+            <Value>2</Value>
+        </EnumEntry>
+        <pValue>AcquisitionModeReg</pValue>
+    </Enumeration>
+
+    <IntReg Name="AcquisitionModeReg">
+        <Address>0x10030</Address>
+        <Length>4</Length>
+        <AccessMode>RW</AccessMode>
+        <pPort>Device</pPort>
+        <Sign>Unsigned</Sign>
+        <Endianess>LittleEndian</Endianess>
+    </IntReg>
+
+    <Command Name="AcquisitionStart">
+        <pValue>AcquisitionStartReg</pValue>
+        <CommandValue>1</CommandValue>
+    </Command>
+
+    <IntReg Name="AcquisitionStartReg">
+        <Address>0x10040</Address>
+        <Length>4</Length>
+        <AccessMode>WO</AccessMode>
+        <pPort>Device</pPort>
+        <Sign>Unsigned</Sign>
+        <Endianess>LittleEndian</Endianess>
+    </IntReg>
+
+    <Command Name="AcquisitionStop">
+        <pValue>AcquisitionStopReg</pValue>
+        <CommandValue>1</CommandValue>
+    </Command>
+
+    <IntReg Name="AcquisitionStopReg">
+        <Address>0x10044</Address>
+        <Length>4</Length>
+        <AccessMode>WO</AccessMode>
+        <pPort>Device</pPort>
+        <Sign>Unsigned</Sign>
+        <Endianess>LittleEndian</Endianess>
+    </IntReg>
+
+    <MaskedIntReg Name="StatusBitFlag">
+        <Address>0x10050</Address>
+        <Length>4</Length>
+        <AccessMode>RW</AccessMode>
+        <pPort>Device</pPort>
+        <Sign>Unsigned</Sign>
+        <Endianess>LittleEndian</Endianess>
+        <LSB>4</LSB>
+        <MSB>7</MSB>
+    </MaskedIntReg>
+
+    <Port Name="Device" />
+
+</RegisterDescription>

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/nb_adm/Desktop/Neuer Ordner/Genicam/**)",
+      "Read(//c/Users/nb_adm/Desktop/Neuer Ordner/**)",
+      "WebSearch",
+      "WebFetch(domain:www.emva.org)",
+      "Bash(julia --version)",
+      "Bash(julia --project=. -e 'using GenICam')",
+      "Bash(julia --project=. -e 'using GenICam; println\\(\"loaded OK\"\\)')",
+      "Bash(julia --project=. -e ' *)",
+      "Bash(julia --project=. -e 'using GenICam; println\\(\"loaded OK\"\\); println\\(\"Acquisition type: \", GenICam.GenTL.Acquisition\\)')",
+      "Bash(julia --project=. -e 'using GenICam; println\\(\"loaded OK\"\\); println\\(\"exports: \", names\\(GenICam\\)\\)')"
+    ]
+  }
+}
