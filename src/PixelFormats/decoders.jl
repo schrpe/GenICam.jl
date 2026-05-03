@@ -4,9 +4,11 @@ Per-format decoders, dispatched on `Val(:decode_*)` symbols stored in
 
 Each decoder takes the raw `Frame` plus the spec and returns a `DecodedFrame`
 whose `image` field is a typed Julia matrix sized `(height, width)`. Camera
-buffers are row-major; Julia matrices are column-major; the standard idiom
-to bridge them is `permutedims(reshape(linear, width, height))`, which costs
-one allocation but produces the natural `img[row, col]` indexing.
+buffers are row-major; Julia matrices are column-major. To bridge them we
+allocate a `Matrix{T}(undef, h, w)` once and write directly into it in
+row-by-row order — the natural `img[r, c]` indexing then gives the correct
+pixel without a separate transpose pass. This is one allocation per frame;
+the older `permutedims(reshape(...))` idiom paid two and is gone.
 
 Pixel-format codes pinned by the PFNC standard
 (https://www.emva.org/wp-content/uploads/PFNC.h). For packed formats the
@@ -33,30 +35,121 @@ end
     return view(frame.data, 1:expected)
 end
 
-# Reshape a row-major linear buffer of element type T into a column-major
-# Matrix{T} of size (h, w) so that img[r, c] indexes naturally.
-@inline function _row_major_to_matrix(linear::AbstractVector, w::Integer, h::Integer)
-    return permutedims(reshape(linear, w, h))
+# Common per-row copy pattern shared by every fast decoder. Marked @inline so
+# the @simd inner loop survives across the call boundary; @inbounds is safe
+# because we already validated the payload size in `_payload_view`.
+@inline function _copy_pixels!(out::AbstractMatrix{T},
+                                src::AbstractVector{T},
+                                w::Integer, h::Integer) where {T}
+    @inbounds for r in 1:h
+        base = (r - 1) * w
+        @simd for c in 1:w
+            out[r, c] = src[base + c]
+        end
+    end
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# BufferPool — a small ring of reusable output matrices for `start_stream`
+# ---------------------------------------------------------------------------
+#
+# At full camera rate (e.g. 1280×1024 RGB8 @ 30 fps) the per-frame
+# `Matrix{T}(undef, h, w)` allocation in each decoder runs the Julia heap at
+# ~120 MB/s, which triggers GC pauses that visibly stall the consumer. With
+# a `BufferPool`, `_decode!` rotates through a small ring of pre-allocated
+# matrices, eliminating that allocation entirely after the first frame.
+#
+# Slot lifetime: a slot is reused after `capacity` more frames have been
+# decoded. Consumers must not retain a slot reference past that window.
+# `LatestFrameBuffer`-style "always read the most recent frame" semantics
+# (the typical GUI-preview pattern) sit comfortably inside this window for
+# any reasonable `capacity` (default 4 ⇒ ~130 ms at 30 fps).
+
+"""
+    BufferPool(capacity::Integer = 4)
+
+Ring of reusable decoded-frame matrices. Pass to [`start_stream`](@ref) (or
+to `decode_frame!`) to make the streaming task allocation-free on the hot
+path.
+
+Lazy per-format: only the field matching the camera's pixel format actually
+gets populated, on the first frame. Subsequent frames of the same shape and
+type reuse the slots round-robin. If the camera switches format mid-stream
+(rare), the ring for the new format is allocated on first sight; the old
+ring becomes garbage on the next collection.
+"""
+mutable struct BufferPool
+    capacity::Int
+    rgb8::Vector{Matrix{RGB{N0f8}}}
+    bgr8::Vector{Matrix{BGR{N0f8}}}
+    rgba8::Vector{Matrix{RGBA{N0f8}}}
+    bgra8::Vector{Matrix{BGRA{N0f8}}}
+    gray8::Vector{Matrix{Gray{N0f8}}}
+    gray16::Vector{Matrix{Gray{N0f16}}}
+    next::Int
+    BufferPool(capacity::Integer = 4) = new(
+        Int(capacity),
+        Matrix{RGB{N0f8}}[],
+        Matrix{BGR{N0f8}}[],
+        Matrix{RGBA{N0f8}}[],
+        Matrix{BGRA{N0f8}}[],
+        Matrix{Gray{N0f8}}[],
+        Matrix{Gray{N0f16}}[],
+        1,
+    )
+end
+
+Base.show(io::IO, p::BufferPool) =
+    print(io, "BufferPool(capacity=", p.capacity, ", next=", p.next, ")")
+
+# Per-type slot accessor. (Re-)allocates the matching ring on shape/type
+# change; otherwise returns the next slot in round-robin order. The returned
+# matrix is the caller's to overwrite — the next call advances the index, so
+# the previous slot stays available for the consumer to read.
+@inline function _slot!(pool::BufferPool, ring::Vector{Matrix{T}},
+                         h::Int, w::Int) where {T}
+    if length(ring) != pool.capacity || (pool.capacity > 0 && size(ring[1]) != (h, w))
+        empty!(ring)
+        sizehint!(ring, pool.capacity)
+        for _ in 1:pool.capacity
+            push!(ring, Matrix{T}(undef, h, w))
+        end
+        pool.next = 1
+    end
+    out = ring[pool.next]
+    pool.next = pool.next == pool.capacity ? 1 : pool.next + 1
+    return out
 end
 
 # ---------------------------------------------------------------------------
 # Monochrome — unpacked
 # ---------------------------------------------------------------------------
 
-function _decode(::Val{:decode_mono8}, frame::Frame, spec::PixelFormatSpec)
+function _decode!(out::AbstractMatrix{Gray{N0f8}}, ::Val{:decode_mono8},
+                   frame::Frame, spec::PixelFormatSpec)
     w, h = _wh(frame)
     bytes = _payload_view(frame, w * h)
     src = reinterpret(Gray{N0f8}, bytes)
-    img = _row_major_to_matrix(src, w, h)
-    return DecodedFrame(img, spec.name, :none)
+    _copy_pixels!(out, src, w, h)
+    return DecodedFrame(out, spec.name, :none)
+end
+function _decode(v::Val{:decode_mono8}, f::Frame, s::PixelFormatSpec)
+    w, h = _wh(f)
+    return _decode!(Matrix{Gray{N0f8}}(undef, h, w), v, f, s)
 end
 
-function _decode(::Val{:decode_mono16}, frame::Frame, spec::PixelFormatSpec)
+function _decode!(out::AbstractMatrix{Gray{N0f16}}, ::Val{:decode_mono16},
+                   frame::Frame, spec::PixelFormatSpec)
     w, h = _wh(frame)
     bytes = _payload_view(frame, 2 * w * h)
     src = reinterpret(Gray{N0f16}, bytes)
-    img = _row_major_to_matrix(src, w, h)
-    return DecodedFrame(img, spec.name, :none)
+    _copy_pixels!(out, src, w, h)
+    return DecodedFrame(out, spec.name, :none)
+end
+function _decode(v::Val{:decode_mono16}, f::Frame, s::PixelFormatSpec)
+    w, h = _wh(f)
+    return _decode!(Matrix{Gray{N0f16}}(undef, h, w), v, f, s)
 end
 
 # Mono10 / Mono12 / Mono14 are right-justified in a 16-bit container per PFNC
@@ -68,11 +161,14 @@ function _decode_padded_mono(frame::Frame, spec::PixelFormatSpec, bits::Int)
     bytes = _payload_view(frame, 2 * w * h)
     raws = reinterpret(UInt16, bytes)
     shift = 16 - bits
-    out = Vector{Gray{N0f16}}(undef, w * h)
-    @inbounds for i in eachindex(raws)
-        out[i] = reinterpret(Gray{N0f16}, UInt16(raws[i]) << shift)
+    out = Matrix{Gray{N0f16}}(undef, h, w)
+    @inbounds for r in 1:h
+        base = (r - 1) * w
+        @simd for c in 1:w
+            out[r, c] = reinterpret(Gray{N0f16}, UInt16(raws[base + c]) << shift)
+        end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 _decode(::Val{:decode_mono10}, f::Frame, s::PixelFormatSpec) = _decode_padded_mono(f, s, 10)
@@ -85,22 +181,30 @@ _decode(::Val{:decode_mono14}, f::Frame, s::PixelFormatSpec) = _decode_padded_mo
 
 function _decode_subbyte_mono(frame::Frame, spec::PixelFormatSpec, bits::Int)
     w, h = _wh(frame)
+    npix = w * h
     pixels_per_byte = 8 ÷ bits
-    expected = cld(w * h, pixels_per_byte)
+    expected = cld(npix, pixels_per_byte)
     bytes = _payload_view(frame, expected)
-    out = Vector{Gray{N0f8}}(undef, w * h)
+    out = Matrix{Gray{N0f8}}(undef, h, w)
     mask = UInt8((1 << bits) - 1)
     scale = 255 ÷ mask                      # expand to full 0..255 range
-    idx = 0
-    @inbounds for b in bytes
-        for sub in (pixels_per_byte - 1):-1:0
-            idx += 1
-            idx > w * h && break
-            v = (b >> (sub * bits)) & mask
-            out[idx] = reinterpret(Gray{N0f8}, UInt8(v * scale))
+    @inbounds begin
+        r = 1; c = 1; written = 0
+        for b in bytes
+            for sub in (pixels_per_byte - 1):-1:0
+                written >= npix && break
+                v = (b >> (sub * bits)) & mask
+                out[r, c] = reinterpret(Gray{N0f8}, UInt8(v * scale))
+                written += 1
+                c += 1
+                if c > w
+                    c = 1; r += 1
+                end
+            end
+            written >= npix && break
         end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 _decode(::Val{:decode_mono1p}, f::Frame, s::PixelFormatSpec) = _decode_subbyte_mono(f, s, 1)
@@ -121,10 +225,11 @@ function _decode(::Val{:decode_mono10p}, frame::Frame, spec::PixelFormatSpec)
     npix = w * h
     expected = cld(npix * 10, 8)
     bytes = _payload_view(frame, expected)
-    out = Vector{Gray{N0f16}}(undef, npix)
+    out = Matrix{Gray{N0f16}}(undef, h, w)
     @inbounds begin
         i = 1
         j = 0
+        r = 1; c = 1
         while i + 4 <= length(bytes) + 1 && j + 3 < npix
             b0 = UInt16(bytes[i])
             b1 = UInt16(bytes[i+1])
@@ -135,10 +240,14 @@ function _decode(::Val{:decode_mono10p}, frame::Frame, spec::PixelFormatSpec)
             p1 = (b1 >> 2) | ((b2 & 0x0F) << 6)
             p2 = (b2 >> 4) | ((b3 & 0x3F) << 4)
             p3 = (b3 >> 6) | (b4 << 2)
-            out[j+1] = reinterpret(Gray{N0f16}, p0 << 6)
-            out[j+2] = reinterpret(Gray{N0f16}, p1 << 6)
-            out[j+3] = reinterpret(Gray{N0f16}, p2 << 6)
-            out[j+4] = reinterpret(Gray{N0f16}, p3 << 6)
+            out[r, c] = reinterpret(Gray{N0f16}, p0 << 6); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = reinterpret(Gray{N0f16}, p1 << 6); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = reinterpret(Gray{N0f16}, p2 << 6); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = reinterpret(Gray{N0f16}, p3 << 6); c += 1
+            if c > w; c = 1; r += 1; end
             i += 5
             j += 4
         end
@@ -148,12 +257,13 @@ function _decode(::Val{:decode_mono10p}, frame::Frame, spec::PixelFormatSpec)
             b = bitpos ÷ 8
             o = bitpos & 7
             v = (UInt32(bytes[b+1]) | (UInt32(bytes[b+2]) << 8)) >> o
-            out[j+1] = reinterpret(Gray{N0f16}, UInt16(v & 0x03FF) << 6)
+            out[r, c] = reinterpret(Gray{N0f16}, UInt16(v & 0x03FF) << 6); c += 1
+            if c > w; c = 1; r += 1; end
             bitpos += 10
             j += 1
         end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 # Mono12p (PFNC §4.2.7): 2 pixels in 3 bytes, LSB-first.
@@ -164,18 +274,21 @@ function _decode(::Val{:decode_mono12p}, frame::Frame, spec::PixelFormatSpec)
     npix = w * h
     expected = cld(npix * 12, 8)
     bytes = _payload_view(frame, expected)
-    out = Vector{Gray{N0f16}}(undef, npix)
+    out = Matrix{Gray{N0f16}}(undef, h, w)
     @inbounds begin
         i = 1
         j = 0
+        r = 1; c = 1
         while j + 2 <= npix
             b0 = UInt16(bytes[i])
             b1 = UInt16(bytes[i+1])
             b2 = UInt16(bytes[i+2])
             p0 = b0 | ((b1 & 0x0F) << 8)
             p1 = (b1 >> 4) | (b2 << 4)
-            out[j+1] = reinterpret(Gray{N0f16}, p0 << 4)
-            out[j+2] = reinterpret(Gray{N0f16}, p1 << 4)
+            out[r, c] = reinterpret(Gray{N0f16}, p0 << 4); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = reinterpret(Gray{N0f16}, p1 << 4); c += 1
+            if c > w; c = 1; r += 1; end
             i += 3
             j += 2
         end
@@ -183,10 +296,10 @@ function _decode(::Val{:decode_mono12p}, frame::Frame, spec::PixelFormatSpec)
         if j < npix
             b0 = UInt16(bytes[i])
             b1 = UInt16(bytes[i+1])
-            out[j+1] = reinterpret(Gray{N0f16}, (b0 | ((b1 & 0x0F) << 8)) << 4)
+            out[r, c] = reinterpret(Gray{N0f16}, (b0 | ((b1 & 0x0F) << 8)) << 4)
         end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 # Mono10Packed (legacy GigE Vision): 2 pixels in 3 bytes; byte1 holds the
@@ -197,27 +310,30 @@ function _decode(::Val{:decode_mono10packed}, frame::Frame, spec::PixelFormatSpe
     npix = w * h
     expected = cld(npix * 12, 8)            # 12 bytes per 8 pixels = 1.5 bytes/pixel
     bytes = _payload_view(frame, expected)
-    out = Vector{Gray{N0f16}}(undef, npix)
+    out = Matrix{Gray{N0f16}}(undef, h, w)
     @inbounds begin
         i = 1
         j = 0
+        r = 1; c = 1
         while j + 2 <= npix
             b0 = UInt16(bytes[i])
             b1 = UInt16(bytes[i+1])
             b2 = UInt16(bytes[i+2])
             p0 = (b0 << 2) | (b1 & 0x03)
             p1 = (b2 << 2) | ((b1 >> 4) & 0x03)
-            out[j+1] = reinterpret(Gray{N0f16}, p0 << 6)
-            out[j+2] = reinterpret(Gray{N0f16}, p1 << 6)
+            out[r, c] = reinterpret(Gray{N0f16}, p0 << 6); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = reinterpret(Gray{N0f16}, p1 << 6); c += 1
+            if c > w; c = 1; r += 1; end
             i += 3
             j += 2
         end
         if j < npix
-            out[j+1] = reinterpret(Gray{N0f16},
+            out[r, c] = reinterpret(Gray{N0f16},
                 ((UInt16(bytes[i]) << 2) | (UInt16(bytes[i+1]) & 0x03)) << 6)
         end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 # Mono12Packed (legacy GigE Vision): 2 pixels in 3 bytes.
@@ -229,39 +345,47 @@ function _decode(::Val{:decode_mono12packed}, frame::Frame, spec::PixelFormatSpe
     npix = w * h
     expected = cld(npix * 12, 8)
     bytes = _payload_view(frame, expected)
-    out = Vector{Gray{N0f16}}(undef, npix)
+    out = Matrix{Gray{N0f16}}(undef, h, w)
     @inbounds begin
         i = 1
         j = 0
+        r = 1; c = 1
         while j + 2 <= npix
             b0 = UInt16(bytes[i])
             b1 = UInt16(bytes[i+1])
             b2 = UInt16(bytes[i+2])
             p0 = (b0 << 4) | (b1 & 0x0F)
             p1 = (b2 << 4) | ((b1 >> 4) & 0x0F)
-            out[j+1] = reinterpret(Gray{N0f16}, p0 << 4)
-            out[j+2] = reinterpret(Gray{N0f16}, p1 << 4)
+            out[r, c] = reinterpret(Gray{N0f16}, p0 << 4); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = reinterpret(Gray{N0f16}, p1 << 4); c += 1
+            if c > w; c = 1; r += 1; end
             i += 3
             j += 2
         end
         if j < npix
-            out[j+1] = reinterpret(Gray{N0f16},
+            out[r, c] = reinterpret(Gray{N0f16},
                 ((UInt16(bytes[i]) << 4) | (UInt16(bytes[i+1]) & 0x0F)) << 4)
         end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 # ---------------------------------------------------------------------------
 # Bayer — same payload layout as Mono of the same depth, only the CFA tag differs
 # ---------------------------------------------------------------------------
 
-function _decode(::Val{:decode_bayer8}, frame::Frame, spec::PixelFormatSpec)
+function _decode!(out::AbstractMatrix{Gray{N0f8}}, ::Val{:decode_bayer8},
+                   frame::Frame, spec::PixelFormatSpec)
     w, h = _wh(frame)
     bytes = _payload_view(frame, w * h)
     src = reinterpret(Gray{N0f8}, bytes)
-    img = _row_major_to_matrix(src, w, h)
-    return DecodedFrame(img, spec.name, spec.cfa)
+    _copy_pixels!(out, src, w, h)
+    return DecodedFrame(out, spec.name, spec.cfa)
+end
+function _decode(v::Val{:decode_bayer8}, f::Frame, s::PixelFormatSpec)
+    w, h = _wh(f)
+    return _decode!(Matrix{Gray{N0f8}}(undef, h, w), v, f, s)
 end
 
 function _decode_padded_bayer(frame::Frame, spec::PixelFormatSpec, bits::Int)
@@ -272,11 +396,14 @@ function _decode_padded_bayer(frame::Frame, spec::PixelFormatSpec, bits::Int)
     bytes = _payload_view(frame, 2 * w * h)
     raws = reinterpret(UInt16, bytes)
     shift = 16 - bits
-    out = Vector{Gray{N0f16}}(undef, w * h)
-    @inbounds for i in eachindex(raws)
-        out[i] = reinterpret(Gray{N0f16}, UInt16(raws[i]) << shift)
+    out = Matrix{Gray{N0f16}}(undef, h, w)
+    @inbounds for r in 1:h
+        base = (r - 1) * w
+        @simd for c in 1:w
+            out[r, c] = reinterpret(Gray{N0f16}, UInt16(raws[base + c]) << shift)
+        end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, spec.cfa)
+    return DecodedFrame(out, spec.name, spec.cfa)
 end
 
 _decode(::Val{:decode_bayer10}, f::Frame, s::PixelFormatSpec) = _decode_padded_bayer(f, s, 10)
@@ -302,36 +429,57 @@ end
 # RGB / BGR — interleaved 8-bit per channel
 # ---------------------------------------------------------------------------
 
-function _decode(::Val{:decode_rgb8}, frame::Frame, spec::PixelFormatSpec)
+function _decode!(out::AbstractMatrix{RGB{N0f8}}, ::Val{:decode_rgb8},
+                   frame::Frame, spec::PixelFormatSpec)
     w, h = _wh(frame)
     bytes = _payload_view(frame, 3 * w * h)
     src = reinterpret(RGB{N0f8}, bytes)
-    img = _row_major_to_matrix(src, w, h)
-    return DecodedFrame(img, spec.name, :none)
+    _copy_pixels!(out, src, w, h)
+    return DecodedFrame(out, spec.name, :none)
+end
+function _decode(v::Val{:decode_rgb8}, f::Frame, s::PixelFormatSpec)
+    w, h = _wh(f)
+    return _decode!(Matrix{RGB{N0f8}}(undef, h, w), v, f, s)
 end
 
-function _decode(::Val{:decode_bgr8}, frame::Frame, spec::PixelFormatSpec)
+function _decode!(out::AbstractMatrix{BGR{N0f8}}, ::Val{:decode_bgr8},
+                   frame::Frame, spec::PixelFormatSpec)
     w, h = _wh(frame)
     bytes = _payload_view(frame, 3 * w * h)
     src = reinterpret(BGR{N0f8}, bytes)
-    img = _row_major_to_matrix(src, w, h)
-    return DecodedFrame(img, spec.name, :none)
+    _copy_pixels!(out, src, w, h)
+    return DecodedFrame(out, spec.name, :none)
+end
+function _decode(v::Val{:decode_bgr8}, f::Frame, s::PixelFormatSpec)
+    w, h = _wh(f)
+    return _decode!(Matrix{BGR{N0f8}}(undef, h, w), v, f, s)
 end
 
-function _decode(::Val{:decode_rgba8}, frame::Frame, spec::PixelFormatSpec)
+function _decode!(out::AbstractMatrix{RGBA{N0f8}}, ::Val{:decode_rgba8},
+                   frame::Frame, spec::PixelFormatSpec)
     w, h = _wh(frame)
     bytes = _payload_view(frame, 4 * w * h)
     src = reinterpret(RGBA{N0f8}, bytes)
-    img = _row_major_to_matrix(src, w, h)
-    return DecodedFrame(img, spec.name, :none)
+    _copy_pixels!(out, src, w, h)
+    return DecodedFrame(out, spec.name, :none)
+end
+function _decode(v::Val{:decode_rgba8}, f::Frame, s::PixelFormatSpec)
+    w, h = _wh(f)
+    return _decode!(Matrix{RGBA{N0f8}}(undef, h, w), v, f, s)
 end
 
 function _decode(::Val{:decode_bgra8}, frame::Frame, spec::PixelFormatSpec)
     w, h = _wh(frame)
     bytes = _payload_view(frame, 4 * w * h)
     src = reinterpret(BGRA{N0f8}, bytes)
-    img = _row_major_to_matrix(src, w, h)
-    return DecodedFrame(img, spec.name, :none)
+    out = Matrix{BGRA{N0f8}}(undef, h, w)
+    @inbounds for r in 1:h
+        base = (r - 1) * w
+        @simd for c in 1:w
+            out[r, c] = src[base + c]
+        end
+    end
+    return DecodedFrame(out, spec.name, :none)
 end
 
 # ---------------------------------------------------------------------------
@@ -340,23 +488,26 @@ end
 
 function _decode_rgb16_generic(frame::Frame, spec::PixelFormatSpec, ::Type{C}) where {C}
     w, h = _wh(frame)
-    npix = w * h
-    bytes = _payload_view(frame, 6 * npix)
-    raws = reinterpret(UInt16, bytes)        # 3 channels per pixel = 3*npix elements
+    bytes = _payload_view(frame, 6 * w * h)
+    raws = reinterpret(UInt16, bytes)        # 3 channels per pixel
     bpc = spec.bits_per_pixel ÷ 3            # bits per channel (24 for RGB8 not handled here)
     shift = 16 - bpc
-    out = Vector{C}(undef, npix)
-    @inbounds for i in 1:npix
-        c1 = UInt16(raws[3i-2]) << shift
-        c2 = UInt16(raws[3i-1]) << shift
-        c3 = UInt16(raws[3i  ]) << shift
-        out[i] = if C === RGB{N0f16}
-            RGB(reinterpret(N0f16, c1), reinterpret(N0f16, c2), reinterpret(N0f16, c3))
-        else  # BGR{N0f16}
-            BGR(reinterpret(N0f16, c1), reinterpret(N0f16, c2), reinterpret(N0f16, c3))
+    out = Matrix{C}(undef, h, w)
+    @inbounds for r in 1:h
+        base = (r - 1) * w
+        for c in 1:w
+            i = base + c
+            c1 = UInt16(raws[3i-2]) << shift
+            c2 = UInt16(raws[3i-1]) << shift
+            c3 = UInt16(raws[3i  ]) << shift
+            out[r, c] = if C === RGB{N0f16}
+                RGB(reinterpret(N0f16, c1), reinterpret(N0f16, c2), reinterpret(N0f16, c3))
+            else  # BGR{N0f16}
+                BGR(reinterpret(N0f16, c1), reinterpret(N0f16, c2), reinterpret(N0f16, c3))
+            end
         end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 _decode(::Val{:decode_rgb16}, f::Frame, s::PixelFormatSpec) =
@@ -373,22 +524,24 @@ _decode(::Val{:decode_bgr16}, f::Frame, s::PixelFormatSpec) =
 
 function _decode_packed10p32(frame::Frame, spec::PixelFormatSpec, ::Type{C}) where {C}
     w, h = _wh(frame)
-    npix = w * h
-    bytes = _payload_view(frame, 4 * npix)
+    bytes = _payload_view(frame, 4 * w * h)
     words = reinterpret(UInt32, bytes)
-    out = Vector{C}(undef, npix)
-    @inbounds for i in 1:npix
-        word = htol(words[i])
-        c1 = UInt16(word & 0x3FF) << 6
-        c2 = UInt16((word >> 10) & 0x3FF) << 6
-        c3 = UInt16((word >> 20) & 0x3FF) << 6
-        out[i] = if C === RGB{N0f16}
-            RGB(reinterpret(N0f16, c1), reinterpret(N0f16, c2), reinterpret(N0f16, c3))
-        else
-            BGR(reinterpret(N0f16, c1), reinterpret(N0f16, c2), reinterpret(N0f16, c3))
+    out = Matrix{C}(undef, h, w)
+    @inbounds for r in 1:h
+        base = (r - 1) * w
+        for c in 1:w
+            word = htol(words[base + c])
+            c1 = UInt16(word & 0x3FF) << 6
+            c2 = UInt16((word >> 10) & 0x3FF) << 6
+            c3 = UInt16((word >> 20) & 0x3FF) << 6
+            out[r, c] = if C === RGB{N0f16}
+                RGB(reinterpret(N0f16, c1), reinterpret(N0f16, c2), reinterpret(N0f16, c3))
+            else
+                BGR(reinterpret(N0f16, c1), reinterpret(N0f16, c2), reinterpret(N0f16, c3))
+            end
         end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 _decode(::Val{:decode_rgb10p32}, f::Frame, s::PixelFormatSpec) =
@@ -418,17 +571,22 @@ function _decode(::Val{:decode_yuv422_uyvy}, frame::Frame, spec::PixelFormatSpec
     w, h = _wh(frame)
     npix = w * h
     bytes = _payload_view(frame, 2 * npix)
-    out = Vector{RGB{N0f8}}(undef, npix)
-    @inbounds for i in 1:2:npix
-        idx = (i - 1) * 2 + 1
-        u  = bytes[idx]
-        y0 = bytes[idx+1]
-        v  = bytes[idx+2]
-        y1 = bytes[idx+3]
-        out[i]   = _yuv_to_rgb(y0, u, v)
-        out[i+1] = _yuv_to_rgb(y1, u, v)
+    out = Matrix{RGB{N0f8}}(undef, h, w)
+    @inbounds begin
+        r = 1; c = 1
+        for i in 1:2:npix
+            idx = (i - 1) * 2 + 1
+            u  = bytes[idx]
+            y0 = bytes[idx+1]
+            v  = bytes[idx+2]
+            y1 = bytes[idx+3]
+            out[r, c] = _yuv_to_rgb(y0, u, v); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = _yuv_to_rgb(y1, u, v); c += 1
+            if c > w; c = 1; r += 1; end
+        end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 # YUV422_8: byte order [Y0, U, Y1, V].
@@ -436,17 +594,22 @@ function _decode(::Val{:decode_yuv422_yuyv}, frame::Frame, spec::PixelFormatSpec
     w, h = _wh(frame)
     npix = w * h
     bytes = _payload_view(frame, 2 * npix)
-    out = Vector{RGB{N0f8}}(undef, npix)
-    @inbounds for i in 1:2:npix
-        idx = (i - 1) * 2 + 1
-        y0 = bytes[idx]
-        u  = bytes[idx+1]
-        y1 = bytes[idx+2]
-        v  = bytes[idx+3]
-        out[i]   = _yuv_to_rgb(y0, u, v)
-        out[i+1] = _yuv_to_rgb(y1, u, v)
+    out = Matrix{RGB{N0f8}}(undef, h, w)
+    @inbounds begin
+        r = 1; c = 1
+        for i in 1:2:npix
+            idx = (i - 1) * 2 + 1
+            y0 = bytes[idx]
+            u  = bytes[idx+1]
+            y1 = bytes[idx+2]
+            v  = bytes[idx+3]
+            out[r, c] = _yuv_to_rgb(y0, u, v); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = _yuv_to_rgb(y1, u, v); c += 1
+            if c > w; c = 1; r += 1; end
+        end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 # YUV411_8_UYYVYY: 6 bytes encode 4 pixels. Byte order [U, Y0, Y1, V, Y2, Y3].
@@ -454,37 +617,46 @@ function _decode(::Val{:decode_yuv411_uyyvyy}, frame::Frame, spec::PixelFormatSp
     w, h = _wh(frame)
     npix = w * h
     bytes = _payload_view(frame, 6 * (npix ÷ 4))
-    out = Vector{RGB{N0f8}}(undef, npix)
-    @inbounds for i in 1:4:npix
-        idx = ((i - 1) ÷ 4) * 6 + 1
-        u  = bytes[idx]
-        y0 = bytes[idx+1]
-        y1 = bytes[idx+2]
-        v  = bytes[idx+3]
-        y2 = bytes[idx+4]
-        y3 = bytes[idx+5]
-        out[i]   = _yuv_to_rgb(y0, u, v)
-        out[i+1] = _yuv_to_rgb(y1, u, v)
-        out[i+2] = _yuv_to_rgb(y2, u, v)
-        out[i+3] = _yuv_to_rgb(y3, u, v)
+    out = Matrix{RGB{N0f8}}(undef, h, w)
+    @inbounds begin
+        r = 1; c = 1
+        for i in 1:4:npix
+            idx = ((i - 1) ÷ 4) * 6 + 1
+            u  = bytes[idx]
+            y0 = bytes[idx+1]
+            y1 = bytes[idx+2]
+            v  = bytes[idx+3]
+            y2 = bytes[idx+4]
+            y3 = bytes[idx+5]
+            out[r, c] = _yuv_to_rgb(y0, u, v); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = _yuv_to_rgb(y1, u, v); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = _yuv_to_rgb(y2, u, v); c += 1
+            if c > w; c = 1; r += 1; end
+            out[r, c] = _yuv_to_rgb(y3, u, v); c += 1
+            if c > w; c = 1; r += 1; end
+        end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 # YUV8_UYV: 3 bytes per pixel, no chroma subsampling.
 function _decode(::Val{:decode_yuv444_uyv}, frame::Frame, spec::PixelFormatSpec)
     w, h = _wh(frame)
-    npix = w * h
-    bytes = _payload_view(frame, 3 * npix)
-    out = Vector{RGB{N0f8}}(undef, npix)
-    @inbounds for i in 1:npix
-        idx = (i - 1) * 3 + 1
-        u = bytes[idx]
-        y = bytes[idx+1]
-        v = bytes[idx+2]
-        out[i] = _yuv_to_rgb(y, u, v)
+    bytes = _payload_view(frame, 3 * w * h)
+    out = Matrix{RGB{N0f8}}(undef, h, w)
+    @inbounds for r in 1:h
+        base = (r - 1) * w
+        for c in 1:w
+            idx = (base + c - 1) * 3 + 1
+            u = bytes[idx]
+            y = bytes[idx+1]
+            v = bytes[idx+2]
+            out[r, c] = _yuv_to_rgb(y, u, v)
+        end
     end
-    return DecodedFrame(_row_major_to_matrix(out, w, h), spec.name, :none)
+    return DecodedFrame(out, spec.name, :none)
 end
 
 # ---------------------------------------------------------------------------
@@ -495,3 +667,50 @@ function _decode(::Val{T}, ::Frame, spec::PixelFormatSpec) where {T}
     throw(ArgumentError(
         "no decoder method for :$T (format $(spec.name)) — please report"))
 end
+
+# ---------------------------------------------------------------------------
+# Pool-aware dispatch — pick a slot of the right type out of a BufferPool
+# and forward to the matrix-taking `_decode!` above. Formats not listed here
+# simply fall through to the allocating `_decode` (correctness preserved;
+# the pool just doesn't help for them).
+# ---------------------------------------------------------------------------
+
+function _decode!(pool::BufferPool, v::Val{:decode_mono8},
+                   frame::Frame, spec::PixelFormatSpec)
+    w, h = _wh(frame)
+    return _decode!(_slot!(pool, pool.gray8, h, w), v, frame, spec)
+end
+
+function _decode!(pool::BufferPool, v::Val{:decode_mono16},
+                   frame::Frame, spec::PixelFormatSpec)
+    w, h = _wh(frame)
+    return _decode!(_slot!(pool, pool.gray16, h, w), v, frame, spec)
+end
+
+function _decode!(pool::BufferPool, v::Val{:decode_bayer8},
+                   frame::Frame, spec::PixelFormatSpec)
+    w, h = _wh(frame)
+    return _decode!(_slot!(pool, pool.gray8, h, w), v, frame, spec)
+end
+
+function _decode!(pool::BufferPool, v::Val{:decode_rgb8},
+                   frame::Frame, spec::PixelFormatSpec)
+    w, h = _wh(frame)
+    return _decode!(_slot!(pool, pool.rgb8, h, w), v, frame, spec)
+end
+
+function _decode!(pool::BufferPool, v::Val{:decode_bgr8},
+                   frame::Frame, spec::PixelFormatSpec)
+    w, h = _wh(frame)
+    return _decode!(_slot!(pool, pool.bgr8, h, w), v, frame, spec)
+end
+
+function _decode!(pool::BufferPool, v::Val{:decode_rgba8},
+                   frame::Frame, spec::PixelFormatSpec)
+    w, h = _wh(frame)
+    return _decode!(_slot!(pool, pool.rgba8, h, w), v, frame, spec)
+end
+
+# Default fallback: format has no in-place pool variant — allocate.
+@inline _decode!(::BufferPool, v::Val, frame::Frame, spec::PixelFormatSpec) =
+    _decode(v, frame, spec)

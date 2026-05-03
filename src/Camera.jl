@@ -55,7 +55,7 @@ mutable struct Camera
     nodemap::GenApi.Nodemap
     acquisition::Union{Nothing,GenTL.Acquisition}
     stream::Any                # StreamHandle | Nothing — typed Any to break a forward-ref cycle with streaming.jl
-    chunk_bindings::Any        # Vector{ChunkBinding} — typed Any so chunks.jl can define the struct after Camera
+    chunk_bindings::Any        # ChunkBindings | Nothing — typed Any so chunks.jl can define the struct after Camera
     last_chunks::Union{Nothing,Dict{Symbol,Any}}
     event_pump::Any            # EventPump | Nothing — typed Any to break a forward-ref cycle with events.jl
     closed::Bool
@@ -138,7 +138,7 @@ function open_camera(producer::GenTL.Producer,
     end
 
     cam = Camera(producer, iface, device, ds, port, api,
-        nodemap, nothing, nothing, [], nothing, nothing, false)
+        nodemap, nothing, nothing, nothing, nothing, nothing, false)
     finalizer(_finalize_camera, cam)
     return cam
 end
@@ -358,7 +358,7 @@ function _grab_dispatch(cam::Camera, timeout_ms::Integer,
             try
                 frame.incomplete && @warn "frame marked INCOMPLETE by producer"
                 # Pull chunk metadata if the camera has chunks enabled.
-                if !isempty(cam.chunk_bindings)
+                if cam.chunk_bindings !== nothing
                     decode_chunks!(frame, cam)
                     cam.last_chunks = frame.chunks
                 end
@@ -412,6 +412,26 @@ function _decode_with_fallback(frame::GenTL.Frame, cam::Camera)
         end
     end
     return PixelFormats.decode_frame(_with_geometry(frame, cam))
+end
+
+# Pool-aware variant of `_decode_with_fallback`. Identical control flow,
+# but routes through `decode_frame!(pool, …)` which dispatches to the
+# in-place `_decode!(pool, ::Val{X}, …)` overloads so the decoder writes
+# into a pre-allocated pool slot instead of allocating per frame.
+function _decode_with_fallback!(pool::PixelFormats.BufferPool,
+                                  frame::GenTL.Frame, cam::Camera)
+    spec = PixelFormats.spec_for_code(frame.pixel_format_namespace,
+                                        frame.pixel_format)
+    if spec === nothing && haskey(cam.nodemap, "PixelFormat")
+        try
+            name = Symbol(get_feature(cam, :PixelFormat))
+            return PixelFormats.decode_frame!(pool, _with_geometry(frame, cam);
+                pixel_format_hint = name)
+        catch
+            # fall through to throw the UnsupportedPixelFormat from decode_frame!
+        end
+    end
+    return PixelFormats.decode_frame!(pool, _with_geometry(frame, cam))
 end
 
 # If frame.width/height are 0, build a synthetic Frame with the GenApi

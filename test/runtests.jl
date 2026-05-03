@@ -175,6 +175,7 @@ const FIXTURES = joinpath(@__DIR__, "fixtures")
         include(joinpath(@__DIR__, "pixelformats", "test_bayer.jl"))
         include(joinpath(@__DIR__, "pixelformats", "test_rgb.jl"))
         include(joinpath(@__DIR__, "pixelformats", "test_yuv.jl"))
+        include(joinpath(@__DIR__, "pixelformats", "test_alloc.jl"))
     end
 
     @testset "GenApi internals" begin

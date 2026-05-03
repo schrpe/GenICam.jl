@@ -97,6 +97,30 @@ function decode_frame(frame::Frame; pixel_format_hint::Union{Symbol,Nothing} = n
 end
 
 """
+    decode_frame!(pool::BufferPool, frame::Frame; pixel_format_hint=nothing) -> DecodedFrame
+
+Same as [`decode_frame`](@ref) but routes through a [`BufferPool`](@ref)
+so the decoder can write into a pre-allocated matrix instead of allocating
+a fresh one per frame. Used by [`start_stream`](@ref) when its
+`buffer_pool` keyword is supplied.
+
+Falls back to allocating decode for any format that doesn't have a
+pool-aware variant (currently the YUV / packed / 16-bit-RGB families) —
+correctness is preserved, the pool just doesn't help for those.
+"""
+function decode_frame!(pool, frame::Frame;
+                        pixel_format_hint::Union{Symbol,Nothing} = nothing)
+    spec = if pixel_format_hint !== nothing
+        spec_for_name(pixel_format_hint)
+    else
+        spec_for_code(frame.pixel_format_namespace, frame.pixel_format)
+    end
+    spec === nothing && throw(UnsupportedPixelFormat(
+        frame.pixel_format, frame.pixel_format_namespace, pixel_format_hint))
+    return _decode!(pool, Val(spec.decoder), frame, spec)
+end
+
+"""
     UnsupportedPixelFormat <: Exception
 
 Raised by `decode_frame` when the buffer's pixel format isn't in the PFNC
@@ -118,7 +142,8 @@ function Base.showerror(io::IO, e::UnsupportedPixelFormat)
     end
 end
 
-export DecodedFrame, decode_frame, UnsupportedPixelFormat,
+export DecodedFrame, decode_frame, decode_frame!,
+    BufferPool, UnsupportedPixelFormat,
     PixelFormatSpec, spec_for_code, spec_for_name,
     PFNC_FORMATS
 

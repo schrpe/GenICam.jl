@@ -40,6 +40,28 @@ struct ChunkBinding
     node::GenApi.Node
 end
 
+"""
+    ChunkBindings
+
+Pre-split bindings cache stored on `cam.chunk_bindings` after
+[`enable_chunks!`](@ref). Holds the two binding flavours separately so
+`decode_chunks!` doesn't have to filter the full list per frame — at
+30+ fps that filter showed up as two `Vector{ChunkBinding}` allocations
+per frame on the streaming hot path.
+
+  * `canonical` — bindings whose nodes carry a `<ChunkID>` (`chunk_id != 0`).
+    Decoded by carving bytes out of the buffer payload via
+    `DSGetBufferChunkData`.
+  * `virtual`   — producer-virtual bindings (`chunk_id == 0`, e.g.
+    mvBlueFOX). Decoded by reading through the regular nodemap accessor.
+"""
+struct ChunkBindings
+    canonical::Vector{ChunkBinding}
+    virtual::Vector{ChunkBinding}
+end
+
+Base.isempty(cb::ChunkBindings) = isempty(cb.canonical) && isempty(cb.virtual)
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -98,7 +120,8 @@ function enable_chunks!(cam::Camera, names::Vector{Symbol})
 
     set_feature!(cam, :ChunkModeActive, true)
 
-    bindings = ChunkBinding[]
+    canonical = ChunkBinding[]
+    virtual = ChunkBinding[]
     for nm in names
         # The selector entry corresponds to the chunk name with the
         # "Chunk" prefix usually stripped — most cameras use the bare
@@ -126,11 +149,18 @@ function enable_chunks!(cam::Camera, names::Vector{Symbol})
             end
         end
         node === nothing && continue
-        # ChunkID == 0 means producer-virtual binding (read via nodemap).
-        push!(bindings, ChunkBinding(nm, node.meta.chunk_id, node))
+        binding = ChunkBinding(nm, node.meta.chunk_id, node)
+        # ChunkID == 0 means producer-virtual binding (read via nodemap);
+        # otherwise it's the canonical buffer-payload binding. Splitting
+        # here keeps `decode_chunks!` allocation-free per frame.
+        if binding.chunk_id != 0
+            push!(canonical, binding)
+        else
+            push!(virtual, binding)
+        end
     end
 
-    cam.chunk_bindings = bindings
+    cam.chunk_bindings = ChunkBindings(canonical, virtual)
     return cam
 end
 
@@ -146,7 +176,7 @@ function disable_chunks!(cam::Camera)
         catch
         end
     end
-    cam.chunk_bindings = ChunkBinding[]
+    cam.chunk_bindings = nothing
     return cam
 end
 
@@ -165,13 +195,14 @@ ask the producer for the per-chunk offsets/lengths via
 If `cam.chunk_bindings` is empty, this is a fast no-op.
 """
 function decode_chunks!(frame::GenTL.Frame, cam::Camera)
-    isempty(cam.chunk_bindings) && return frame
+    cb = cam.chunk_bindings
+    cb === nothing && return frame
+    isempty(cb) && return frame
     decoded = Dict{Symbol,Any}()
 
     # Path A — canonical: try DSGetBufferChunkData. Yields offsets/lengths
     # that we slice out of the buffer payload by ChunkID.
-    canonical_bindings = ChunkBinding[b for b in cam.chunk_bindings if b.chunk_id != 0]
-    if !isempty(canonical_bindings)
+    if !isempty(cb.canonical)
         ds = cam.datastream.handle
         chunks = try
             GenTL.ds_get_buffer_chunk_data(cam.api, ds, frame.handle)
@@ -179,7 +210,7 @@ function decode_chunks!(frame::GenTL.Frame, cam::Camera)
             GenTL.SINGLE_CHUNK_DATA[]
         end
         for c in chunks
-            b = _find_binding(canonical_bindings, c.ChunkID)
+            b = _find_binding(cb.canonical, c.ChunkID)
             b === nothing && continue
             try
                 decoded[b.name] = _decode_chunk_value(b.node, frame.data,
@@ -197,8 +228,7 @@ function decode_chunks!(frame::GenTL.Frame, cam::Camera)
     # but the per-node read cache would otherwise hand back the value of
     # the *first* frame we ever saw — clear it so each grab pays the
     # register read.
-    virtual_bindings = ChunkBinding[b for b in cam.chunk_bindings if b.chunk_id == 0]
-    for b in virtual_bindings
+    for b in cb.virtual
         _invalidate_chain_cache!(b.node)
         try
             decoded[b.name] = get_feature(cam, b.node.name)

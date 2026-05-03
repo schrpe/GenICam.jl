@@ -38,7 +38,7 @@ include("hotplug.jl")
 export GenTL, GenApi, PixelFormats,
     Camera, open_camera, list_cameras,
     get_feature, set_feature!, execute_command!, grab, grab_raw,
-    DecodedFrame,
+    DecodedFrame, BufferPool,
     # SFNC convenience
     set_aoi!, reset_aoi!, set_trigger!, disable_trigger!,
     set_exposure!, set_gain!,

@@ -118,7 +118,8 @@ function start_stream(cam::Camera;
                        decode::Bool = true,
                        channel_size::Integer = 4,
                        policy::StreamPolicy = DROP_OLDEST,
-                       timeout_ms::Integer = 1000)
+                       timeout_ms::Integer = 1000,
+                       buffer_pool::Union{Nothing,PixelFormats.BufferPool} = nothing)
     cam.closed && throw(ArgumentError("Camera is closed"))
     is_streaming(cam) && throw(ArgumentError(
         "Camera already has an active stream — call stop_stream(cam) first"))
@@ -147,7 +148,13 @@ function start_stream(cam::Camera;
     acq = GenTL.Acquisition(cam.datastream;
         num_buffers = num_buffers, payload_size = psize)
 
-    channel = Channel{Any}(Int(channel_size))
+    # Type the channel as concretely as the decode mode allows. With decode=true
+    # the producer pushes `DecodedFrame` (still parametric on the image array
+    # type, but better than `Any`); with decode=false it pushes `Vector{UInt8}`
+    # (fully concrete). Avoids one box per frame at the producer/consumer
+    # boundary and lets specialization recover dispatch on the consumer side.
+    channel = decode ? Channel{DecodedFrame}(Int(channel_size)) :
+                       Channel{Vector{UInt8}}(Int(channel_size))
     stop_sig = Threads.Atomic{Bool}(false)
     grabbed = Threads.Atomic{Int}(0)
     dropped = Threads.Atomic{Int}(0)
@@ -155,7 +162,7 @@ function start_stream(cam::Camera;
     # Build the streaming task before starting acquisition so a fast
     # producer doesn't fill the buffer pool before our task is reading.
     task = Threads.@spawn _stream_loop(cam, acq, channel, stop_sig,
-        grabbed, dropped, policy, decode, Int(timeout_ms))
+        grabbed, dropped, policy, decode, Int(timeout_ms), buffer_pool)
 
     sh = StreamHandle(cam, acq, channel, task, stop_sig,
         grabbed, dropped, policy, decode, false)
@@ -187,9 +194,28 @@ function _stream_loop(cam::Camera, acq::GenTL.Acquisition, channel::Channel,
                        grabbed::Threads.Atomic{Int},
                        dropped::Threads.Atomic{Int},
                        policy::StreamPolicy, decode::Bool,
-                       timeout_ms::Int)
+                       timeout_ms::Int,
+                       buffer_pool::Union{Nothing,PixelFormats.BufferPool} = nothing)
+    @info "GenICam._stream_loop: pool=$(buffer_pool === nothing ? "<none>" : "BufferPool(cap=$(buffer_pool.capacity))") tid=$(Threads.threadid())"
+    consecutive_timeouts = 0
+    # Per-iteration timing diagnostic. Tracks the longest single-iteration
+    # delay in each window so we can see whether time is being lost inside
+    # the ccall (camera/USB), inside decode (Julia work), inside requeue,
+    # or BETWEEN iterations (Julia scheduler not resuming the task).
+    iter_count       = 0
+    last_iter_end_ns = UInt64(0)
+    max_pre_ns       = UInt64(0)   # time between previous iter end and this take! call
+    max_take_ns      = UInt64(0)   # time inside next_frame_or_timeout
+    max_decode_ns    = UInt64(0)   # decode time
+    max_push_ns      = UInt64(0)   # requeue + push to channel
     try
         while !stop_sig[]
+            iter_start_ns = time_ns()
+            if last_iter_end_ns != 0
+                pre_ns = iter_start_ns - last_iter_end_ns
+                pre_ns > max_pre_ns && (max_pre_ns = pre_ns)
+            end
+
             frame = nothing
             try
                 frame = GenTL.next_frame_or_timeout(acq; timeout_ms = timeout_ms)
@@ -197,14 +223,34 @@ function _stream_loop(cam::Camera, acq::GenTL.Acquisition, channel::Channel,
                 @error "streaming loop: next_frame_or_timeout threw" exception = e
                 break
             end
-            frame === nothing && continue        # timeout — re-check stop_sig
+            take_end_ns = time_ns()
+            take_dt_ns = take_end_ns - iter_start_ns
+            take_dt_ns > max_take_ns && (max_take_ns = take_dt_ns)
 
-            # Decode (allocates a fresh image) or copy the raw payload —
-            # in either case we leave nothing aliasing the producer pool
-            # past the requeue! below.
+            if frame === nothing
+                # Timeout — the GenTL producer didn't deliver a buffer
+                # within `timeout_ms`. On a healthy USB3 camera at 10 fps
+                # this should never happen. Bursts of consecutive timeouts
+                # point to USB power management / Selective Suspend or
+                # producer-side buffer starvation.
+                consecutive_timeouts += 1
+                @warn "streaming loop: next_frame_or_timeout timeout ($(timeout_ms) ms) — consecutive=$consecutive_timeouts grabbed=$(grabbed[]) dropped=$(dropped[]) tid=$(Threads.threadid())"
+                last_iter_end_ns = time_ns()
+                continue
+            end
+            consecutive_timeouts = 0
+
+            # Decode (allocates a fresh image — or writes into a pool slot
+            # when `buffer_pool` is supplied) or copy the raw payload — in
+            # either case we leave nothing aliasing the producer pool past
+            # the requeue! below.
             payload = try
                 if decode
-                    _decode_with_fallback(frame, cam)
+                    if buffer_pool === nothing
+                        _decode_with_fallback(frame, cam)
+                    else
+                        _decode_with_fallback!(buffer_pool, frame, cam)
+                    end
                 else
                     copy(view(frame.data, 1:Int(frame.size_filled)))
                 end
@@ -214,6 +260,9 @@ function _stream_loop(cam::Camera, acq::GenTL.Acquisition, channel::Channel,
                 try; GenTL.requeue!(acq, frame); catch; end
                 continue
             end
+            decode_end_ns = time_ns()
+            decode_dt_ns = decode_end_ns - take_end_ns
+            decode_dt_ns > max_decode_ns && (max_decode_ns = decode_dt_ns)
 
             # Re-queue immediately so the producer never starves while
             # the channel is blocked.
@@ -226,6 +275,20 @@ function _stream_loop(cam::Camera, acq::GenTL.Acquisition, channel::Channel,
 
             _push_with_policy!(channel, payload, policy, dropped)
             Threads.atomic_add!(grabbed, 1)
+            push_end_ns = time_ns()
+            push_dt_ns = push_end_ns - decode_end_ns
+            push_dt_ns > max_push_ns && (max_push_ns = push_dt_ns)
+            iter_count += 1
+            last_iter_end_ns = push_end_ns
+
+            # Window log every 100 frames so we can see how time is split.
+            if iter_count == 1 || iter_count % 100 == 0
+                @info "GenICam._stream_loop window iter=$iter_count grabbed=$(grabbed[]) dropped=$(dropped[]) max_pre=$(round(max_pre_ns/1e6, digits=1))ms max_take=$(round(max_take_ns/1e6, digits=1))ms max_decode=$(round(max_decode_ns/1e6, digits=2))ms max_push=$(round(max_push_ns/1e6, digits=2))ms"
+                max_pre_ns    = UInt64(0)
+                max_take_ns   = UInt64(0)
+                max_decode_ns = UInt64(0)
+                max_push_ns   = UInt64(0)
+            end
         end
     finally
         # No matter how we exit, signal the consumer side that the
