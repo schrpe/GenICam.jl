@@ -1,7 +1,10 @@
 # GenICam.jl
 
+[![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://schrpe.github.io/GenICam.jl/stable)
+[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://schrpe.github.io/GenICam.jl/dev)
 [![Tests](https://github.com/schrpe/GenICam.jl/actions/workflows/Tests.yml/badge.svg)](https://github.com/schrpe/GenICam.jl/actions/workflows/Tests.yml)
-[![Documentation](https://github.com/schrpe/GenICam.jl/actions/workflows/Documentation.yml/badge.svg)](https://schrpe.github.io/GenICam.jl)
+[![Documentation](https://github.com/schrpe/GenICam.jl/actions/workflows/Documentation.yml/badge.svg)](https://github.com/schrpe/GenICam.jl/actions/workflows/Documentation.yml)
+[![Code Style: Blue](https://img.shields.io/badge/code%20style-blue-4495d1.svg)](https://github.com/invenia/BlueStyle)
 
 Pure-Julia implementation of the EMVA **GenICam** standard family —
 device discovery, configuration, image acquisition, and per-frame
