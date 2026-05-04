@@ -16,10 +16,11 @@ jobs:
   test:
     name: Julia ${{ matrix.julia-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.julia-version == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
-        julia-version: ['1.12']
+        julia-version: ['1.12', 'nightly']
         julia-arch: [x64]
         os:
           - ubuntu-latest

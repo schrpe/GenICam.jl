@@ -15,8 +15,8 @@ DocMeta.setdocmeta!(
 makedocs(
     modules  = [GenICam, GenICam.GenTL, GenICam.GenApi, GenICam.PixelFormats],
     authors  = "schrpe",
+    repo     = "https://github.com/schrpe/GenICam.jl/blob/{commit}{path}#{line}",
     sitename = "GenICam.jl",
-    remotes  = nothing,
     format   = Documenter.HTML(;
         prettyurls = get(ENV, "CI", "false") == "true",
         canonical  = "https://schrpe.github.io/GenICam.jl",
@@ -46,4 +46,8 @@ makedocs(
     # handful of @enum value names (DROP_OLDEST, BIG_ENDIAN, etc.)
     # that don't carry their own doc-string by Julia convention.
     checkdocs = :none,
+)
+
+deploydocs(;
+    repo = "github.com/schrpe/GenICam.jl",
 )

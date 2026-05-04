@@ -101,7 +101,7 @@ end
 
 Same as [`decode_frame`](@ref) but routes through a [`BufferPool`](@ref)
 so the decoder can write into a pre-allocated matrix instead of allocating
-a fresh one per frame. Used by [`start_stream`](@ref) when its
+a fresh one per frame. Used by [`start_stream`](@ref GenICam.start_stream) when its
 `buffer_pool` keyword is supplied.
 
 Falls back to allocating decode for any format that doesn't have a

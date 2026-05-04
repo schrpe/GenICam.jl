@@ -69,7 +69,7 @@ end
 """
     BufferPool(capacity::Integer = 4)
 
-Ring of reusable decoded-frame matrices. Pass to [`start_stream`](@ref) (or
+Ring of reusable decoded-frame matrices. Pass to [`start_stream`](@ref GenICam.start_stream) (or
 to `decode_frame!`) to make the streaming task allocation-free on the hot
 path.
 
