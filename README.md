@@ -106,17 +106,6 @@ End-to-end live-tested with:
 - **MATRIX VISION mvBlueFOX3-1013C** (USB3 Vision color camera)
 - via the **Balluff Impact Acquire** GenTL producer
 
-Live numbers from a recent acceptance run:
-
-| Metric | Result |
-|---|---|
-| Nodes parsed from camera XML | 1 184 |
-| Features exposed | 654 |
-| Full-feature read-walk success | **99.85 %** in 1.2 s |
-| Mandatory SFNC features (Width/Height/PixelFormat/PayloadSize/AcquisitionMode/Start/Stop) | all read & written |
-| Pixel formats decoded live | Mono8, Mono10, Mono12, BayerRG8, BayerRG10, RGB10p32 |
-| Streaming throughput | 12.6 fps at 320×240 Mono8 (limited by camera default exposure) |
-
 ## Documentation
 
 Full docs at <https://schrpe.github.io/GenICam.jl> covering:
