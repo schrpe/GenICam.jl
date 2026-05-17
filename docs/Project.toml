@@ -1,3 +1,6 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 GenICam = "877cf6bb-8a86-4aba-855a-f87d24631fe5"
+
+[compat]
+GenICam = "0.2"
